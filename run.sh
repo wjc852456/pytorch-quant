@@ -1,0 +1,20 @@
+python quantize-retrain.py \
+--gpu "0,1,2,3" \
+--use_model_zoo 0 \
+--type MobileNetV2 \
+--batch_size 512 \
+--n_sample 16 \
+--replace_bn 0 \
+--map_bn 0 \
+--workers 8 \
+--overflow_rate 0.001 \
+--test 0 \
+--lr 0.001 \
+--param_bits $1 \
+--fwd_bits $2 \
+--save_path "./output_$1-$2btis/" \
+--num_epochs 20 \
+--print_freq 1 \
+--save_epoch_freq 1 \
+--start_epoch 1 \
+--resume ''

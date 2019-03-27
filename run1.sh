@@ -1,0 +1,11 @@
+python quantize-linear2.py \
+--gpu "0" \
+--use_model_zoo 0 \
+--type MobileNetV2 \
+--batch_size 32 \
+--n_sample 4 \
+--replace_bn 0 \
+--map_bn 1 \
+--param_bits 8 \
+--fwd_bits 8 \
+--test 0 \
