@@ -46,9 +46,9 @@ def compute_delta(input, bits, overflow_rate=0):
     split_idx = int(overflow_rate * len(sorted_value))
     v = sorted_value[split_idx]
     v = v.item()
-    si = math.ceil(math.log(v+1e-12,2))
-    sf = bits - 1 - si
-    delta = math.pow(2.0, -sf)
+    I_max = 2**(bits-1)-1
+    si = math.floor(math.log(I_max/(v+1e-12),2))
+    delta = math.pow(2.0, -si)
     return delta
 
 def linear_quantize2(input, bits, delta):
@@ -60,7 +60,8 @@ def linear_quantize2(input, bits, delta):
     rounded = QuantOp_floor.apply(input)
     #clipped_value = torch.clamp(rounded, min_val, max_val)
     clipped_value = QuantOp_clamp.apply(rounded, min_val, max_val)
-    q_input = delta * clipped_value
+    #q_input = delta * clipped_value
+    q_input = clipped_value
     return q_input
 
 def compute_delta_perchannel(input, bits, overflow_rate=0):
@@ -111,6 +112,20 @@ def linear_quantize_perchannel(input, bits, delta):
     else:
         q_input = quant_value.reshape(N,-1)
     return q_input
+
+def quantize_param(model):
+    if isinstance(model, nn.Sequential):
+        for k,v in model._modules.items():
+            if isinstance(v,(nn.Conv2d, nn.Linear)):
+                v_quant,S,Z = quant.scale_quantize(v.weight, args.param_bits)
+                v.weight = Parameter(v_quant)
+                v.S = S
+                v.Z = Z
+            else:
+                quantize_param(v)
+    else:
+        for k,v in model._modules.items():
+            quantize_param(v)
 
 
 
@@ -322,19 +337,20 @@ class LinearQuant(nn.Module):
             self.__class__.__name__, self.sf, self.bits, self.overflow_rate, self.counter)
 
 class ScaleQuant(nn.Module):
-    def __init__(self, name, bits, module, counter=10):
+    def __init__(self, name, param_bits, fwd_bits, module, counter=10):
         super(ScaleQuant, self).__init__()
         self.name = name
         self._counter = counter
         self.max_cnt = counter
-        self.bits = bits
+        self.param_bits = param_bits
+        self.fwd_bits = fwd_bits
         self.module = copy.deepcopy(module)
         self.m1 = copy.deepcopy(module)
         self.m2 = copy.deepcopy(module)
         self.m3 = copy.deepcopy(module)
         self.quant_module = copy.deepcopy(module)
 
-        quant_weight, self.S1, self.Z1 = scale_quantize(self.module.weight, self.bits)
+        quant_weight, self.S1, self.Z1 = scale_quantize(self.module.weight, self.param_bits)
         #print("quant_weight:\n{}".format(quant_weight.view(-1).sort(descending=True)[0]))
         self.quant_module.weight = Parameter(quant_weight)
         self.bias = module.bias
@@ -357,7 +373,7 @@ class ScaleQuant(nn.Module):
             self._counter -= 1
             _, S2, Z2 = scale_quantize(input, self.bits)
             #self.S2, self.Z2  = S2, Z2
-            self.S2 = (S2+self.S2*(self.max_cnt-self._counter))/(self.max_cnt-self._counter+1)
+            self.S2 = (S2+self.S2*(self.max_cnt-self._counter)) / (self.max_cnt-self._counter+1)
             self.Z2 = round((Z2+self.Z2*(self.max_cnt-self._counter))/(self.max_cnt-self._counter+1))
             #print("S2:{},Z2:{}".format(self.S2,self.Z2))
             output = self.module(input)
@@ -398,6 +414,77 @@ class ScaleQuant(nn.Module):
             #print(output.view(-1).sort(dim=0,descending=True)[0])
             #print('\n')
             return output
+
+class LinearQuant_NoBN(nn.Module):
+    def __init__(self, name, param_bits, fwd_bits, conv, delta_b=None, overflow_rate=0.0, counter=10):
+        super(LinearQuant_NoBN, self).__init__()
+        self.delta_b = delta_b
+        self.delta_list = []
+        self.name = name
+        self._counter = counter
+        self.param_bits = param_bits
+        self.fwd_bits = fwd_bits
+        self.overflow_rate = overflow_rate
+
+        self.stride = conv.stride
+        self.padding = conv.padding
+        self.dilation = conv.dilation
+        self.groups = conv.groups
+        self.conv_out_channels = conv.out_channels
+
+        self.conv_weight = conv.weight
+        self.bias = conv.bias
+
+        self.delta_a = compute_delta(conv.weight, param_bits, overflow_rate)
+        self.q_weight = linear_quantize2(conv.weight, param_bits, self.delta_a)
+        #print(math.log(self.delta_a,2))
+        #print(conv.weight.abs().contiguous().view(-1).topk(5))
+
+        if isinstance(conv, nn.Conv2d):
+            self.F_ct = F.conv2d
+        else:
+            self.F_ct = F.conv_transpose2d
+            #print(conv.weight.abs().contiguous().view(-1).topk(5))
+
+    @property
+    def counter(self):
+        return self._counter
+    
+    def forward(self, input):
+        if self._counter > 0: # decide input quantization bits
+            self._counter -= 1
+            #print("counter:{}".format(self._counter))
+            delta_b = compute_delta(input, self.fwd_bits, self.overflow_rate)
+            self.delta_list.append(delta_b)
+            if self._counter == 0:
+                #self.delta_list.sort()
+                half_len = len(self.delta_list) // 2
+                self.delta_b = self.delta_list[half_len]
+                self.q_bias = linear_quantize2(self.bias, self.fwd_bits, self.delta_b)
+                N = self.q_bias.shape[0]
+                self.q_bias_reshape = self.q_bias.reshape(N,1,1)
+                #print("quant bias:",self.q_bias / self.delta_b)
+                #print(math.log(self.delta_a,2),math.log(self.delta_a,2))
+            output = self.F_ct(input, self.conv_weight, self.bias, 
+                            self.stride, self.padding, self.dilation, self.groups)
+            return output
+        else:
+            q_input = linear_quantize2(input, self.fwd_bits, self.delta_b)
+
+            q_output = self.F_ct(q_input, self.q_weight, None, self.stride,
+                        self.padding, self.dilation, self.groups)
+            #print(q_output.contiguous().view(-1).topk(5))
+            #print(len(q_output[q_output>32767]))
+            q_output = q_output * self.delta_a * self.delta_b
+            self.q_bias_reshape *= self.delta_b
+            q_output += self.q_bias_reshape
+
+            #print(q_output.contiguous().view(-1).topk(5))
+            return q_output
+
+
+
+
 
 class LogQuant(nn.Module):
     def __init__(self, name, bits, sf=None, overflow_rate=0.0, counter=10):
@@ -488,8 +575,6 @@ class LinearQuant2(nn.Module):
             q_output = self.q_module(q_input)
             q_output = q_output * self.delta_a * self.delta_b
             return q_output
-
-
 
 class Linear_Quant(nn.Module):
     def __init__(self, name, param_bits, fwd_bits, module, delta_b=None, overflow_rate=0.0, counter=10):
@@ -642,14 +727,17 @@ def duplicate_model_with_quant(model, bits, overflow_rate=0.0, counter=10, type=
             model._modules[k] = duplicate_model_with_quant(v, bits, overflow_rate, counter, type)
         return model
 
-def duplicate_model_with_scalequant(model, bits, counter=10):
+def duplicate_model_with_scalequant(model, param_bits, fwd_bits, counter=10):
     """assume that original model has at least a nn.Sequential"""
     if isinstance(model, nn.Sequential):
         l = OrderedDict()
         for k, v in model._modules.items():
             if isinstance(v, (nn.Conv2d, nn.Linear, nn.AvgPool2d)):
-                quant_layer = ScaleQuant(name='{}_quant'.format(k), bits=bits, 
-                module=v, counter=counter)
+                quant_layer = ScaleQuant(name='{}_quant'.format(k), 
+                                        param_bits=param_bits,
+                                        fwd_bits=fwd_bits, 
+                                        module=v, 
+                                        counter=counter)
                 l['{}_scalequant'.format(k)] = quant_layer
             else:
                 l[k] = duplicate_model_with_scalequant(v, bits, counter)
@@ -667,8 +755,10 @@ def duplicate_model_with_linearquant(model, param_bits, fwd_bits, overflow_rate=
         for k, v in model._modules.items():
             if isinstance(v, (nn.Conv2d, nn.Linear)):
                 quant_layer = LinearQuant2(name='{}_quant'.format(k), 
-                param_bits=param_bits, fwd_bits=fwd_bits,
-                module=v, counter=counter)
+                                        param_bits=param_bits, 
+                                        fwd_bits=fwd_bits,
+                                        module=v, 
+                                        counter=counter)
                 l['{}_linearquant2'.format(k)] = quant_layer
             else:
                 l[k] = duplicate_model_with_linearquant(v, param_bits, fwd_bits, overflow_rate, counter)
@@ -677,4 +767,34 @@ def duplicate_model_with_linearquant(model, param_bits, fwd_bits, overflow_rate=
     else:
         for k, v in model._modules.items():
             model._modules[k] = duplicate_model_with_linearquant(v, param_bits, fwd_bits, overflow_rate, counter)
+        return model
+
+def duplicate_model_with_linearquant_nobn(model, param_bits, fwd_bits, overflow_rate=0.0, counter=10):
+    """assume that original model has at least a nn.Sequential"""
+    if isinstance(model, nn.Sequential):
+        l = OrderedDict()
+        for k, v in model._modules.items():
+            if isinstance(v, (nn.Conv2d, nn.ConvTranspose2d)):
+                quant_layer = LinearQuant_NoBN(name='{}_nobnquant'.format(k), 
+                                            param_bits=param_bits, 
+                                            fwd_bits=fwd_bits,
+                                            overflow_rate = overflow_rate,
+                                            conv=v, 
+                                            counter=counter)
+                l['{}_linearquant2'.format(k)] = quant_layer
+            else:
+                l[k] = duplicate_model_with_linearquant_nobn(v, param_bits, fwd_bits, overflow_rate, counter)
+        m = nn.Sequential(l)
+        return m
+    elif isinstance(model, (nn.Conv2d, nn.ConvTranspose2d)):
+        quant_layer = LinearQuant_NoBN(name='nobnquant', 
+                                    param_bits=param_bits, 
+                                    fwd_bits=fwd_bits,
+                                    overflow_rate = overflow_rate,
+                                    conv=model, 
+                                    counter=counter)
+        return quant_layer       
+    else:
+        for k, v in model._modules.items():
+            model._modules[k] = duplicate_model_with_linearquant_nobn(v, param_bits, fwd_bits, overflow_rate, counter)
         return model

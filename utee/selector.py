@@ -167,15 +167,18 @@ def select(model_name, **kwargs): # return one of the functions above
     kwargs.setdefault('model_root', os.path.expanduser('~/.torch/models'))
     return eval('{}'.format(model_name))(**kwargs)
 
-def find(model_name, model_root, net_root):
-    root_list = net_root.split('/')
-    path = '/'.join(root_list[0:-1])
-    sys.path.append(os.path.expanduser(path))
-    exec('from {} import {}'.format(root_list[-1][:-3], model_name))
-    model = eval('{}()'.format(model_name))
+def find(model_name, model_root, net_root, **kwargs):
+    if net_root==None:
+        model = torch.load(os.path.expanduser(model_root))
+    else:
+        root_list = net_root.split('/')
+        path = '/'.join(root_list[0:-1])
+        sys.path.append(os.path.expanduser(path))
+        exec('from {} import {}'.format(root_list[-1][:-3], model_name))
+        model = eval('{}()'.format(model_name))
     if model_root==None:
         pass
-    else:
+    elif net_root!=None:
         model.load_state_dict(torch.load(os.path.expanduser(model_root)))
     return model, dataset.get
 

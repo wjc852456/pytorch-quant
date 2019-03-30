@@ -1,7 +1,4 @@
 import sys
-sys.path.append("../")
-sys.path.append("../../")
-sys.path.append("/home/jcwang")
 import os
 import os.path
 import numpy as np
@@ -11,18 +8,29 @@ import torchvision.transforms as transforms
 import torchvision.datasets as datasets
 #import torchvision.models as models
 from utee import misc
-from sequential_imagenet_dataloader import data as lmdb_data
+import sequential_imagenet_dataloader
+#from sequential_imagenet_dataloader.imagenet_seq import data as lmdb_data
+import sequential_imagenet_dataloader.imagenet_seq.data as lmdb_data
+
+sys.path.append("../")
+sys.path.append("../../")
+HOME = os.path.expanduser("~")
+sys.path.append(HOME)
+
 
 data_root = "~/dataset/"
 
 normalize = transforms.Normalize(mean=[0.485, 0.456, 0.406],       
                                     std=[0.229, 0.224, 0.225])
 
+
+
 def get(batch_size=10, data_root=data_root, train=False, val=True, shuffle=True, **kwargs):
     data_root = os.path.expanduser(data_root)
-    print("Building IMAGENET data loader, 50000 for test")
+    #print("Building IMAGENET data loader, 50000 for test")
     assert train is not True, 'train not supported yet'
-    valdir = os.path.join(data_root, 'val')
+    #valdir = os.path.join(data_root, 'val')
+    valdir = data_root
     #print(data_root)
     val_loader = torch.utils.data.DataLoader(
         datasets.ImageFolder(valdir, 
